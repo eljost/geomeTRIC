@@ -2,6 +2,7 @@
 
 from __future__ import print_function, division
 
+from pathlib import Path
 import shutil
 import subprocess
 from collections import OrderedDict
@@ -9,6 +10,7 @@ from copy import deepcopy
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import pyparsing as pp
 import re
 import os
 
@@ -923,3 +925,301 @@ class ConicalIntersection(Engine):
         for istate in [1, 2]:
             state_dnm = os.path.join(dirname, 'state_%i' % istate)
             self.engines[istate].number_output(state_dnm, calcNum)
+
+
+#=============================#
+#| Useful TURBOMOLE functions |#
+#=============================#
+
+
+def to_float(s, loc, toks):
+    match = toks[0].replace("D", "E")
+    return float(match)
+
+def make_float_class(**kwargs):
+    return pp.Word(pp.nums + ".-DE+", **kwargs).setParseAction(to_float)
+
+
+def parse_turbo_gradient(path):
+    results = {}
+    gradient_fn = glob.glob(os.path.join(path, "gradient"))
+    if not gradient_fn:
+        raise Exception("gradient file not found!")
+    assert(len(gradient_fn) == 1)
+    gradient_fn = gradient_fn[0]
+    with open(gradient_fn) as handle:
+        text = handle.read()
+
+    float_ = make_float_class()
+    cycle = pp.Word(pp.nums).setResultsName("cycle")
+    scf_energy = float_.setResultsName("scf_energy")
+    grad_norm = float_.setResultsName("grad_norm")
+    float_line = float_ + float_ + float_
+    coord_line = pp.Group(float_line + pp.Word(pp.alphas))
+    grad_line = pp.Group(float_line)
+    cart_grads = pp.Literal("cartesian gradients")
+    energy_type = pp.Or((pp.Literal("SCF energy"),
+                        pp.Literal("ex. state energy"),
+                        pp.Literal("CC2 energy"),
+                        pp.Literal("ADC(2) energy"),
+                        pp.Literal("MP2 energy"),
+    ))
+
+    parser = (
+        pp.Literal("$grad") + pp.Optional(cart_grads) +
+        pp.Literal("cycle =") + cycle +
+        energy_type + pp.Literal("=") + scf_energy +
+        pp.Literal("|dE/dxyz| =") + grad_norm +
+        pp.OneOrMore(coord_line).setResultsName("coords") +
+        pp.OneOrMore(grad_line).setResultsName("grad") +
+        pp.Literal("$end")
+    )
+    parsed = parser.parseString(text)
+    gradient = np.array(parsed["grad"].asList()).flatten()
+
+    results["energy"] = parsed["scf_energy"]
+    results["forces"] = -gradient
+    return results
+
+
+class Turbomole(Engine):
+
+    def __init__(self, molecule=None):
+        if molecule is None:
+            # create a fake molecule
+            molecule = Molecule()
+            molecule.elem = ['H']
+            molecule.xyzs = [[[0,0,0]]]
+        super().__init__(molecule)
+
+    def load_turbomole_input(self, control_path):
+        self.control_path = Path(control_path)
+
+        self.to_keep = ("control", "mos", "alpha", "beta", "out",
+                        "gradient",
+        )
+
+        self.parser_funcs = {
+            "force": self.parse_force,
+        }
+
+        # Turbomole uses the 'control' file implicitly
+        self.inp_fn = ""
+        self.out_fn = "turbomole.out"
+        # MO coefficient files
+        self.mos = None
+        self.alpha = None
+        self.beta = None
+
+        # Prepare base_cmd
+        with open(self.control_path / "control") as handle:
+            text = handle.read()
+        scf_cmd = "dscf"
+        second_cmd = "grad"
+        # Check for RI
+        if ("$rij" in text) or ("$rik" in text):
+            scf_cmd = "ridft"
+            second_cmd = "rdgrad"
+            # self.log("Found RI calculation.")
+
+        self.uhf = "$uhf" in text
+
+        self.scf_cmd = scf_cmd
+        self.second_cmd = second_cmd
+        self.base_cmd = ";".join((self.scf_cmd, self.second_cmd))
+        # self.log(f"Using base_cmd {self.base_cmd}")
+
+        with open(self.control_path / "coord") as handle:
+            text = handle.read()
+        coord_re = "\$coord\s+(.+?)\s+\$"
+        mobj = re.match(coord_re, text, re.DOTALL)
+        coords = mobj[1].strip().split()
+        coords = np.array(coords).reshape(-1, 4)
+        atoms = coords[:, -1].tolist()
+        coords = coords[:,:-1].astype("float").reshape(-1, 3)
+
+        self.M = Molecule()
+        self.M.elem = atoms
+        self.M.xyzs = coords * bohr2ang
+
+    def prepare_input(self, atoms, coords, calc_type):
+        if calc_type not in ("force", "noparse"):
+            raise Exception("Can only do force for now.")
+        path = self.prepare_path(use_in_run=True)
+        
+        copy_from = self.control_path
+        # Copy everything from the reference control_dir into this path
+        # Use self.control_path for all calculations except the double
+        # molecule calculation.
+        all_src_paths = copy_from.glob("./*")
+        """Maybe we shouldn't copy everything because it may give convergence
+        problems? Right now we use the initial MO guess generated in the
+        reference path for all images along the path."""
+        globs = [p for p in all_src_paths]
+        for glob in copy_from.glob("./*"):
+            shutil.copy(glob, path)
+        xyz_str = self.prepare_xyz_string(atoms, coords)
+        with open(path / "input.xyz", "w") as handle:
+            handle.write(xyz_str)
+        # Write coordinates
+        coord_str = self.prepare_turbo_coords(atoms, coords)
+        coord_fn = path / "coord"
+        with open(coord_fn, "w") as handle:
+            handle.write(coord_str)
+        # Copy MO coefficients from previous cycle with this calculator
+        # if present.
+        if self.mos:
+            shutil.copy(self.mos, path / "mos")
+            # self.log(f"Using {self.mos} as MO guess.")
+        elif self.alpha and self.beta:
+            shutil.copy(self.alpha, path / "alpha")
+            shutil.copy(self.beta, path / "beta")
+            # self.log(f"Using {self.alpha} and {self.beta} as MO guesses.")
+
+    def sub_control(self, pattern, repl, log_msg="", **kwargs):
+        path = self.path_already_prepared
+        assert path
+        # self.log(f"Updating control file in '{path}' {log_msg}")
+        control_path = path / "control"
+        with open(control_path) as handle:
+            text = handle.read()
+        text = re.sub(pattern, repl, text, **kwargs)
+        with open(control_path, "w") as handle:
+            handle.write(text)
+
+    def get_pal_env(self):
+        env_copy = os.environ.copy()
+        env_copy["PARA_ARCH"] = "SMP"
+        env_copy["PARNODES"] = str(self.pal)
+        env_copy["SMPCPUS"] = str(self.pal)
+
+        return env_copy
+
+    def calc_new(self, coords, dirname):
+        import pdb; pdb.set_trace()
+
+        if not os.path.exists(dirname): os.makedirs(dirname)
+        # Convert coordinates back to the xyz file
+        self.M.xyzs[0] = coords.reshape(-1, 3) * bohr2ang
+        # Write Psi4 input.dat
+        with open(os.path.join(dirname, 'input.dat'), 'w') as outfile:
+            for line in self.psi4_temp:
+                if line == '$!geometry@here':
+                    for i, (e, c) in enumerate(zip(self.M.elem, self.M.xyzs[0])):
+                        if i in self.fragn:
+                            outfile.write('--\n')
+                        outfile.write("%-7s %13.7f %13.7f %13.7f\n" % (e, c[0], c[1], c[2]))
+                else:
+                    outfile.write(line)
+        try:
+            # Run Psi4
+            subprocess.run('psi4%s input.dat' % self.nt(), cwd=dirname, check=True, shell=True)
+            # Read energy and gradients from Psi4 output
+            parsed = self.parse_psi4_output(os.path.join(dirname, 'output.dat'))
+            energy = parsed['energy']
+            gradient = parsed['gradient']
+        except (OSError, IOError, RuntimeError, subprocess.CalledProcessError):
+            raise Psi4EngineError
+        return {'energy':energy, 'gradient':gradient}
+        raise NotImplementedError("Not implemented for the base class")
+
+    def get_forces(self, atoms, coords, cmd=None):
+        self.prepare_input(atoms, coords, "force")
+        kwargs = {
+                "calc": "force",
+                "shell": True, # To allow chained commands like 'ridft; rdgrad'
+                "hold": self.track, # Keep the files for WFOverlap
+                "env": self.get_pal_env(),
+                "cmd": cmd,
+        }
+        # Use inp=None because we don't use any dedicated input besides
+        # the previously prepared control file and the current coords.
+        results = self.run(None, **kwargs)
+        if self.track:
+            prev_run_path = self.last_run_path
+            self.store_overlap_data(atoms, coords)
+            root_flipped = self.track_root()
+            self.calc_counter += 1
+            if root_flipped:
+                # Redo gradient calculation for new root.
+                results = self.get_forces(atoms, coords, cmd=self.second_cmd)
+            self.last_run_path = prev_run_path
+        shutil.rmtree(self.last_run_path)
+        return results
+
+    def run_calculation(self, atoms, coords):
+        """Basically some kind of dummy method that can be called
+        to execute Turbomole with the stored cmd of this calculator."""
+        self.prepare_input(atoms, coords, "noparse")
+        kwargs = {
+                "calc": "noparse",
+                "shell": True,
+                # "hold": self.track, # Keep the files for WFOverlap
+                "env": self.get_pal_env(),
+        }
+        results = self.run(None, **kwargs)
+        if self.track:
+            self.store_overlap_data(atoms, coords)
+        return results
+
+    def parse_force(self, path):
+        results = parse_turbo_gradient(path)
+        return results
+
+    def parse_gs_energy(self):
+        """Several places are possible:
+            $subenergy from control file
+            total energy from turbomole.out
+            Final MP2 energy from turbomole.out with ADC(2)
+            Final CC2 energy from turbomole.out with CC(2)
+        """
+        float_re = "([\d\-\.E]+)"
+        regexs = [
+                  # CC2 ground state energy
+                  ("out", "Final CC2 energy\s*:\s*" + float_re, 0),
+                  # ADC(2) ground state energy
+                  ("out", "Final MP2 energy\s*:\s*" + float_re, 0),
+                  ("control", "\$subenergy.*$\s*" + float_re, re.MULTILINE),
+                  # DSCF ground state energy
+                  ("out", "total energy\s*=\s*" + float_re, 0),
+        ]
+        for file_attr, regex, flag in regexs:
+            regex_ = re.compile(regex, flags=flag)
+            with open(getattr(self, file_attr)) as handle:
+                text = handle.read()
+            mobj = regex_.search(text)
+            try:
+                gs_energy = float(mobj[1])
+                # self.log(f"Parsed ground state energy from '{file_attr}' using "
+                         # f"regex '{regex[:11]}'.")
+                return gs_energy
+            except TypeError:
+                continue
+        raise Exception("Couldn't parse ground state energy!")
+
+    def keep(self, path):
+        kept_fns = super().keep(path)
+        self.out = kept_fns["out"]
+        self.control = kept_fns["control"]
+        if self.uhf:
+            self.alpha = kept_fns["alpha"]
+            self.beta = kept_fns["beta"]
+        else:
+            self.mos = kept_fns["mos"]
+        # Maybe copy more files like the vectors from egrad
+        # sing_a, trip_a, dipl_a etc.
+        assert"ucis_a" not in kept_fns, "Implement for UKS TDA"
+        if self.track:
+            if self.td:
+                td_key_present = [k for k in ("ciss_a", "sing_a", "ucis_a")
+                                  if k in kept_fns][0]
+                self.td_vec_fn = kept_fns[td_key_present]
+            elif self.ricc2:
+                self.ccres = kept_fns["ccres"]
+                self.exstates = kept_fns["exstates"]
+            else:
+                raise Exception("Something went wrong!")
+            self.mwfn_wf = kept_fns["mwfn_wf"]
+
+    def __str__(self):
+        return "Turbomole calculator"

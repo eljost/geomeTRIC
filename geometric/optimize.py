@@ -15,7 +15,7 @@ import pkg_resources
 
 import geometric
 from .logo import printLogo
-from .engine import set_tcenv, load_tcin, TeraChem, ConicalIntersection, Psi4, QChem, Gromacs, Molpro, OpenMM, QCEngineAPI
+from .engine import set_tcenv, load_tcin, TeraChem, ConicalIntersection, Psi4, QChem, Gromacs, Molpro, OpenMM, QCEngineAPI, Turbomole
 from .internal import *
 from .molecule import Molecule, Elements
 from .nifty import row, col, flat, invert_svd, uncommadash, isint, bohr2ang, ang2bohr, logger, bak, pmat2d
@@ -1488,6 +1488,7 @@ def get_molecule_engine(**kwargs):
     gmx = kwargs.get('gmx', False)
     molpro = kwargs.get('molpro', False)
     openmm = kwargs.get('openmm', False)
+    turbomole = kwargs.get('turbomole', False)
     qcengine = kwargs.get('qcengine', False)
     customengine = kwargs.get('customengine', None)
     # Path to Molpro executable (used if molpro=True)
@@ -1531,7 +1532,7 @@ def get_molecule_engine(**kwargs):
         radii[arg_radii[2*i].capitalize()] = float(arg_radii[2*i+1])
 
     if sum([qchem, psi4, gmx, molpro, qcengine, openmm]) > 1:
-        raise RuntimeError("Do not specify more than one of --qchem, --psi4, --gmx, --molpro, --qcengine, --openmm")
+        raise RuntimeError("Do not specify more than one of --qchem, --psi4, --gmx, --molpro, --qcengine, --openmm, --turbomole")
     if qchem:
         # The file from which we make the Molecule object
         if pdb is not None:
@@ -1595,6 +1596,10 @@ def get_molecule_engine(**kwargs):
             raise RuntimeError("QCEngineAPI option requires a qce_program option")
 
         engine = QCEngineAPI(schema, program)
+        M = engine.M
+    elif turbomole:
+        engine = Turbomole()
+        engine.load_turbomole_input(inputf)
         M = engine.M
     elif customengine:
         engine = customengine
@@ -1757,6 +1762,7 @@ def run_optimizer(**kwargs):
     coordsys = kwargs.get('coordsys', 'tric')
     CoordClass, connect, addcart = CoordSysDict[coordsys.lower()]
 
+    import pdb; pdb.set_trace()
     IC = CoordClass(M, build=True, connect=connect, addcart=addcart, constraints=Cons, cvals=CVals[0] if CVals is not None else None,
                     conmethod=params.conmethod)
     #========================================#
@@ -1844,6 +1850,7 @@ def main():
     parser.add_argument('--psi4', action='store_true', help='Compute gradients in Psi4.')
     parser.add_argument('--openmm', action='store_true', help='Compute gradients in OpenMM. Provide state.xml as input, and --pdb is required.')
     parser.add_argument('--gmx', action='store_true', help='Compute gradients in Gromacs (requires conf.gro, topol.top, shot.mdp).')
+    parser.add_argument('--turbomole', action='store_true', help='Compute gradients in Turbomole.')
     parser.add_argument('--meci', type=str, default=None, help='Provide second input file and search for minimum-energy conical '
                         'intersection or crossing point between two SCF solutions (TeraChem and Q-Chem supported).')
     parser.add_argument('--meci_sigma', type=float, default=3.5, help='Sigma parameter for MECI optimization.')
